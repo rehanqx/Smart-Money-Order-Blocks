@@ -1,0 +1,324 @@
+//@version=6
+indicator(
+    title = "Smart Money Concepts V3.2 - Order Block Engine",
+    shorttitle = "SMC V3.2 OB",
+    overlay = true,
+    max_lines_count = 500,
+    max_labels_count = 500,
+    max_boxes_count = 500
+)
+
+// ===================================================
+// SECTION 1 — INPUT SETTINGS & CONFIGURATION
+// ===================================================
+
+group_ob = "━━━ ORDER BLOCK ENGINE SETTINGS (V3.2) ━━━"
+pivot_len        = input.int(10, "Pivot High/Low Length", minval=3, maxval=50, group=group_ob)
+displacement_mult= input.float(1.5, "Displacement Multiplier (vs ATR)", minval=1.0, maxval=3.0, step=0.1, group=group_ob)
+min_ob_strength  = input.int(70, "Minimum Order Block Strength (0-100)", minval=50, maxval=95, group=group_ob)
+max_active_blocks= input.int(15, "Maximum Active Blocks in Memory", minval=5, maxval=30, group=group_ob)
+ob_expiration    = input.int(150, "Order Block Expiration (bars)", minval=30, maxval=300, group=group_ob)
+
+group_visual = "━━━ VISUAL & COLOR STANDARDS ━━━"
+show_bull_ob     = input.bool(true, "Show Bullish Order Blocks", group=group_visual)
+show_bear_ob     = input.bool(true, "Show Bearish Order Blocks", group=group_visual)
+show_breakers    = input.bool(true, "Show Breaker Blocks", group=group_visual)
+show_ob_labels   = input.bool(true, "Show Order Block Labels", group=group_visual)
+show_dashboard   = input.bool(true, "Show Order Block Dashboard", group=group_visual)
+
+col_bull_ob  = input.color(#00796b, "Bullish OB (Dark Green)", group=group_visual)
+col_bear_ob  = input.color(#c62828, "Bearish OB (Dark Red)", group=group_visual)
+col_mitigated= input.color(#00e5ff, "Mitigated OB (Blue)", group=group_visual)
+col_breaker  = input.color(#d500f9, "Breaker Block (Purple)", group=group_visual)
+col_invalid  = input.color(#8b949e, "Invalidated OB (Gray)", group=group_visual)
+
+// Helper Functions for Ratings & Colors
+f_get_ob_rating(score) =>
+    score >= 95 ? "Institutional Grade" : score >= 90 ? "Excellent" : score >= 80 ? "Strong" : score >= 70 ? "Average" : "Weak"
+
+f_get_ob_color(direction, state) =>
+    state == "MITIGATED" or state == "RETESTED" ? col_mitigated :
+     state == "BREAKER" ? col_breaker :
+     state == "INVALIDATED" ? col_invalid :
+     direction == "Bullish" ? col_bull_ob : col_bear_ob
+
+// ===================================================
+// SECTION 2 — CORE INDICATORS & CALCULATORS
+// ===================================================
+
+ema20  = ta.ema(close, 20)
+ema50  = ta.ema(close, 50)
+ema200 = ta.ema(close, 200)
+
+[plus_di, minus_di, adx_val] = ta.dmi(14, 14)
+atr_val = ta.atr(14)
+vol_ma  = ta.sma(volume, 20)
+
+bool is_bull_trend = ema50 > ema200
+bool is_bear_trend = ema50 < ema200
+
+// Displacement Check (Impulsive Body vs ATR)
+candle_body = math.abs(close - open)
+is_displacement = candle_body > (atr_val * displacement_mult) and volume > vol_ma
+int displacement_score = is_displacement ? 90 : (candle_body > atr_val ? 70 : 40)
+
+// ===================================================
+// SECTION 3 — UDT & ORDER BLOCK DETECTION ENGINE
+// ===================================================
+
+type OrderBlock
+    int    id
+    string ob_type           // Bullish OB, Bearish OB, Breaker Block
+    string direction         // Bullish, Bearish
+    int    bar_idx
+    float  top
+    float  bottom
+    string state             // CREATED, CONFIRMED, ACTIVE, MITIGATED, RETESTED, INVALIDATED, ARCHIVED
+    int    priority          // 5 (Highest) down to 1
+    int    strength_score    // 0-100
+    int    quality_score     // 0-100
+    int    mitigation_count
+    int    retest_count
+    int    age_bars
+    box    visual_box
+
+var OrderBlock[] db_blocks = array.new<OrderBlock>(0)
+var int global_id_counter  = 0
+
+ph = ta.pivothigh(high, pivot_len, pivot_len)
+pl = ta.pivotlow(low,   pivot_len, pivot_len)
+
+// Detection Logic: Bullish Order Block (Last bearish candle before impulsive bullish move)
+if is_displacement and close > open and close > high[1] and is_bull_trend
+    int ob_bar = bar_index - 1
+    float ob_top = math.max(open[1], close[1])
+    float ob_bottom = low[1]
+    
+    // Strength Scoring (0-100)
+    int s_struct = 20
+    int s_liq    = 20
+    int s_disp   = is_displacement ? 20 : 10
+    int s_vol    = volume[1] > vol_ma[1] ? 15 : 5
+    int s_regime = adx_val > 25 ? 10 : 5
+    int s_trend  = is_bull_trend ? 10 : 5
+    int s_age    = 5
+    
+    int total_strength = s_struct + s_liq + s_disp + s_vol + s_regime + s_trend + s_age
+    
+    if total_strength >= min_ob_strength
+        global_id_counter := global_id_counter + 1
+        box b_box = show_bull_ob ? box.new(ob_bar, ob_top, bar_index + 10, ob_bottom, bgcolor=color.new(col_bull_ob, 85), border_color=col_bull_ob) : na
+        
+        OrderBlock ob = OrderBlock.new(
+            id = global_id_counter,
+            ob_type = "Bullish OB",
+            direction = "Bullish",
+            bar_idx = ob_bar,
+            top = ob_top,
+            bottom = ob_bottom,
+            state = "ACTIVE",
+            priority = total_strength >= 90 ? 5 : 4,
+            strength_score = total_strength,
+            quality_score = total_strength,
+            mitigation_count = 0,
+            retest_count = 0,
+            age_bars = 1,
+            visual_box = b_box
+        )
+        array.push(db_blocks, ob)
+
+// Detection Logic: Bearish Order Block (Last bullish candle before impulsive bearish move)
+if is_displacement and close < open and close < low[1] and is_bear_trend
+    int ob_bar = bar_index - 1
+    float ob_top = high[1]
+    float ob_bottom = math.min(open[1], close[1])
+    
+    int s_struct = 20
+    int s_liq    = 20
+    int s_disp   = is_displacement ? 20 : 10
+    int s_vol    = volume[1] > vol_ma[1] ? 15 : 5
+    int s_regime = adx_val > 25 ? 10 : 5
+    int s_trend  = is_bear_trend ? 10 : 5
+    int s_age    = 5
+    
+    int total_strength = s_struct + s_liq + s_disp + s_vol + s_regime + s_trend + s_age
+    
+    if total_strength >= min_ob_strength
+        global_id_counter := global_id_counter + 1
+        box b_box = show_bear_ob ? box.new(ob_bar, ob_top, bar_index + 10, ob_bottom, bgcolor=color.new(col_bear_ob, 85), border_color=col_bear_ob) : na
+        
+        OrderBlock ob = OrderBlock.new(
+            id = global_id_counter,
+            ob_type = "Bearish OB",
+            direction = "Bearish",
+            bar_idx = ob_bar,
+            top = ob_top,
+            bottom = ob_bottom,
+            state = "ACTIVE",
+            priority = total_strength >= 90 ? 5 : 4,
+            strength_score = total_strength,
+            quality_score = total_strength,
+            mitigation_count = 0,
+            retest_count = 0,
+            age_bars = 1,
+            visual_box = b_box
+        )
+        array.push(db_blocks, ob)
+
+if array.size(db_blocks) > max_active_blocks
+    array.shift(db_blocks)
+
+// ===================================================
+// SECTION 4 — ORDER BLOCK LIFECYCLE & MITIGATION ENGINE
+// CREATED -> CONFIRMED -> ACTIVE -> MITIGATED -> RETESTED -> INVALIDATED -> ARCHIVED
+// ===================================================
+
+OrderBlock nearest_ob  = na
+OrderBlock strongest_ob= na
+OrderBlock freshest_ob = na
+
+bool ob_mitigated_event = false
+bool breaker_event      = false
+
+if array.size(db_blocks) > 0
+    for i = 0 to array.size(db_blocks) - 1
+        OrderBlock ob = array.get(db_blocks, i)
+        ob.age_bars := bar_index - ob.bar_idx
+        
+        if not na(ob.visual_box)
+            box.set_right(ob.visual_box, bar_index + 5)
+        
+        // Mitigation & Retest Logic
+        if ob.state == "ACTIVE" or ob.state == "RETESTED"
+            if ob.direction == "Bullish"
+                if low <= ob.top and high >= ob.bottom
+                    ob.mitigation_count := ob.mitigation_count + 1
+                    ob.state := "MITIGATED"
+                    ob_mitigated_event := true
+                    if not na(ob.visual_box)
+                        box.set_bgcolor(ob.visual_box, color.new(col_mitigated, 90))
+                else if low < ob.bottom // Broken Bullish OB becomes Bearish Breaker Block
+                    ob.state := "BREAKER"
+                    ob.ob_type := "Bullish Breaker"
+                    breaker_event := true
+                    if not na(ob.visual_box)
+                        box.set_bgcolor(ob.visual_box, color.new(col_breaker, 85))
+            
+            if ob.direction == "Bearish"
+                if high >= ob.bottom and low <= ob.top
+                    ob.mitigation_count := ob.mitigation_count + 1
+                    ob.state := "MITIGATED"
+                    ob_mitigated_event := true
+                    if not na(ob.visual_box)
+                        box.set_bgcolor(ob.visual_box, color.new(col_mitigated, 90))
+                else if high > ob.top // Broken Bearish OB becomes Bullish Breaker Block
+                    ob.state := "BREAKER"
+                    ob.ob_type := "Bearish Breaker"
+                    breaker_event := true
+                    if not na(ob.visual_box)
+                        box.set_bgcolor(ob.visual_box, color.new(col_breaker, 85))
+
+        // Expiration
+        if ob.age_bars > ob_expiration and ob.state == "MITIGATED"
+            ob.state := "ARCHIVED"
+        
+        // Track Nearest & Strongest Active Blocks
+        if ob.state == "ACTIVE" or ob.state == "MITIGATED"
+            if na(nearest_ob) or math.abs(close - ob.top) < math.abs(close - nearest_ob.top)
+                nearest_ob := ob
+            if na(strongest_ob) or ob.strength_score > strongest_ob.strength_score
+                strongest_ob := ob
+            freshest_ob := ob
+
+// Confluence Score Calculation (0-100)
+int confluence_score = not na(nearest_ob) ? math.round((nearest_ob.strength_score + (adx_val > 25 ? 90 : 60)) / 2.0) : 50
+
+// ===================================================
+// SECTION 5 — STANDARDIZED ORDER BLOCK OUTPUT API
+// (Exposed Outputs for V3.3 FVG, V3.4 BOS, V3.5 Confluence, V4 AI, V5 EA)
+// ===================================================
+
+int    export_OrderBlockID             = not na(nearest_ob) ? nearest_ob.id : 0
+string export_OrderBlockType           = not na(nearest_ob) ? nearest_ob.ob_type : "None"
+string export_OrderBlockDirection      = not na(nearest_ob) ? nearest_ob.direction : "None"
+int    export_OrderBlockStrength       = not na(nearest_ob) ? nearest_ob.strength_score : 0
+int    export_OrderBlockQuality        = not na(nearest_ob) ? nearest_ob.quality_score : 0
+int    export_OrderBlockPriority       = not na(nearest_ob) ? nearest_ob.priority : 0
+string export_OrderBlockLifecycle      = not na(nearest_ob) ? nearest_ob.state : "None"
+string export_MitigationStatus         = ob_mitigated_event ? "MITIGATED" : "UNTESTED / ACTIVE"
+int    export_RetestCount              = not na(nearest_ob) ? nearest_ob.retest_count : 0
+int    export_DisplacementScore        = displacement_score
+int    export_ConfluenceScore          = confluence_score
+float  export_NearestOrderBlock        = not na(nearest_ob) ? nearest_ob.top : na
+float  export_HighestProbabilityBlock  = not na(strongest_ob) ? strongest_ob.top : na
+float  export_FreshestBlock            = not na(freshest_ob) ? freshest_ob.top : na
+float  export_StrongestBlock           = not na(strongest_ob) ? strongest_ob.top : na
+bool   export_BreakerStatus            = breaker_event
+bool   export_NestedStatus             = not na(nearest_ob) and nearest_ob.priority >= 5
+
+// ===================================================
+// SECTION 6 — CHARTS & VISUAL PLOTTING
+// ===================================================
+
+plot(ema20,  "EMA 20",  color.new(#00e5ff, 60), linewidth=1)
+plot(ema50,  "EMA 50",  color.new(#ff9100, 60), linewidth=1)
+plot(ema200, "EMA 200", color.new(#d500f9, 60), linewidth=2)
+
+// ===================================================
+// SECTION 7 — MASTER ORDER BLOCK DASHBOARD TABLE
+// ===================================================
+
+var table db = table.new(
+    position=position.top_right,
+    columns=2,
+    rows=11,
+    bgcolor=color.new(#0d1117, 15),
+    border_color=color.new(#30363d, 0),
+    border_width=1,
+    frame_color=color.new(#58a6ff, 50),
+    frame_width=1
+)
+
+if show_dashboard and barstate.islast
+    table.cell(db, 0, 0, "SMC V3.2 ORDER BLOCK ENGINE", text_color=#58a6ff, text_size=size.small, bgcolor=color.new(#161b22, 0), text_halign=text.align_center)
+    table.cell(db, 1, 0, "REALTIME OB STATUS", text_color=#8b949e, text_size=size.small, bgcolor=color.new(#161b22, 0), text_halign=text.align_center)
+
+    table.cell(db, 0, 1, "Nearest Active Order Block", text_color=#c9d1d9, text_size=size.tiny)
+    table.cell(db, 1, 1, export_OrderBlockType + " (" + export_OrderBlockDirection + ")", text_color=export_OrderBlockDirection == "Bullish" ? #00e676 : (export_OrderBlockDirection == "Bearish" ? #ff1744 : #8b949e), text_size=size.tiny)
+
+    table.cell(db, 0, 2, "OB Level (Top / Bottom)", text_color=#c9d1d9, text_size=size.tiny)
+    string ob_lvl_str = not na(nearest_ob) ? (str.tostring(math.round(nearest_ob.top, 2)) + " / " + str.tostring(math.round(nearest_ob.bottom, 2))) : "N/A"
+    table.cell(db, 1, 2, ob_lvl_str, text_color=#58a6ff, text_size=size.tiny)
+
+    table.cell(db, 0, 3, "Lifecycle State", text_color=#c9d1d9, text_size=size.tiny)
+    table.cell(db, 1, 3, export_OrderBlockLifecycle, text_color=#e3b341, text_size=size.tiny)
+
+    table.cell(db, 0, 4, "Block Strength & Quality", text_color=#c9d1d9, text_size=size.tiny)
+    table.cell(db, 1, 4, str.tostring(export_OrderBlockStrength) + "/100 (" + f_get_ob_rating(export_OrderBlockStrength) + ")", text_color=export_OrderBlockStrength >= 80 ? #3fb950 : #d29922, text_size=size.tiny)
+
+    table.cell(db, 0, 5, "Confluence Score", text_color=#c9d1d9, text_size=size.tiny)
+    table.cell(db, 1, 5, str.tostring(confluence_score) + "/100", text_color=confluence_score >= 80 ? #3fb950 : #d29922, text_size=size.tiny)
+
+    table.cell(db, 0, 6, "Mitigation Status", text_color=#c9d1d9, text_size=size.tiny)
+    table.cell(db, 1, 6, export_MitigationStatus, text_color=ob_mitigated_event ? #00e5ff : #3fb950, text_size=size.tiny)
+
+    table.cell(db, 0, 7, "Breaker Block Status", text_color=#c9d1d9, text_size=size.tiny)
+    table.cell(db, 1, 7, breaker_event ? "BREAKER DETECTED" : "NORMAL OB", text_color=breaker_event ? #d500f9 : #8b949e, text_size=size.tiny)
+
+    table.cell(db, 0, 8, "Active Blocks in Memory", text_color=#c9d1d9, text_size=size.tiny)
+    table.cell(db, 1, 8, str.tostring(array.size(db_blocks)) + "/" + str.tostring(max_active_blocks), text_color=#c9d1d9, text_size=size.tiny)
+
+    table.cell(db, 0, 9, "Displacement Quality", text_color=#c9d1d9, text_size=size.tiny)
+    table.cell(db, 1, 9, str.tostring(displacement_score) + "/100 (" + (is_displacement ? "IMPULSE" : "NORMAL") + ")", text_color=is_displacement ? #3fb950 : #8b949e, text_size=size.tiny)
+
+    table.cell(db, 0, 10, "Current ATR (14)", text_color=#c9d1d9, text_size=size.tiny)
+    table.cell(db, 1, 10, str.tostring(math.round(atr_val, 2)), text_color=#e3b341, text_size=size.tiny)
+
+// ===================================================
+// SECTION 8 — ALERTS
+// ===================================================
+
+alertcondition(is_displacement and is_bull_trend, title="New Bullish Order Block", message="⚡ SMC V3.2 NEW BULLISH ORDER BLOCK CREATED: {{ticker}}")
+alertcondition(is_displacement and is_bear_trend, title="New Bearish Order Block", message="⚡ SMC V3.2 NEW BEARISH ORDER BLOCK CREATED: {{ticker}}")
+alertcondition(ob_mitigated_event, title="Order Block Mitigated", message="🔥 SMC V3.2 ORDER BLOCK MITIGATED: {{ticker}}")
+alertcondition(breaker_event, title="Breaker Block Detected", message="⚠️ SMC V3.2 BREAKER BLOCK DETECTED: {{ticker}}")
